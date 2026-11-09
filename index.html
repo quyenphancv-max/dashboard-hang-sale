@@ -1245,67 +1245,209 @@
     }
 
     // Parse Workbook from SheetJS (either uploaded by user or auto-fetched from GitHub repo)
+    function normKey(s) {
+      return String(s || '')
+        .trim()
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/đ/g, 'd')
+        .replace(/[^a-z0-9]/g, '');
+    }
+
+    function cleanNum(val) {
+      if (typeof val === 'number') return isNaN(val) ? 0 : val;
+      if (val === null || val === undefined) return 0;
+      let s = String(val).trim();
+      if (!s) return 0;
+      // Remove spaces and currency symbols
+      s = s.replace(/[^0-9.,-]/g, '');
+      // Handle Vietnamese thousand separators vs decimal
+      if (s.includes(',') && s.includes('.')) {
+        if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
+          s = s.replace(/\./g, '').replace(',', '.');
+        } else {
+          s = s.replace(/,/g, '');
+        }
+      } else if (s.includes(',')) {
+        const parts = s.split(',');
+        if (parts[parts.length - 1].length === 3 && parts.length > 1) {
+          s = s.replace(/,/g, '');
+        } else {
+          s = s.replace(',', '.');
+        }
+      } else if (s.includes('.')) {
+        const parts = s.split('.');
+        if (parts[parts.length - 1].length === 3 && parts.length > 1) {
+          s = s.replace(/\./g, '');
+        }
+      }
+      const n = parseFloat(s);
+      return isNaN(n) ? 0 : n;
+    }
+
+    function sheetToSmartObjects(ws, rawMode = true) {
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: rawMode, defval: '' });
+      if (!rows || rows.length === 0) return [];
+      // Find the header row (first row with at least 2 non-empty cells)
+      let headerIdx = 0;
+      for (let i = 0; i < Math.min(10, rows.length); i++) {
+        const nonEmpty = rows[i].filter(c => String(c || '').trim() !== '').length;
+        if (nonEmpty >= 2) {
+          headerIdx = i;
+          break;
+        }
+      }
+      const headers = rows[headerIdx].map(h => normKey(h));
+      const result = [];
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (!r || r.every(c => String(c || '').trim() === '')) continue;
+        const obj = {};
+        headers.forEach((h, idx) => {
+          if (h) obj[h] = r[idx];
+        });
+        result.push(obj);
+      }
+      return result;
+    }
+
+    function pickField(obj, candidates) {
+      for (const c of candidates) {
+        if (obj[c] !== undefined && obj[c] !== '') return obj[c];
+      }
+      // Partial match fallback
+      const keys = Object.keys(obj);
+      for (const c of candidates) {
+        const found = keys.find(k => k.includes(c));
+        if (found && obj[found] !== undefined && obj[found] !== '') return obj[found];
+      }
+      return '';
+    }
+
+    function parseExcelDate(val) {
+      if (!val) return '';
+      if (typeof val === 'number') {
+        const utcDays = Math.floor(val - 25569);
+        const d = new Date(utcDays * 86400 * 1000);
+        if (!isNaN(d)) return d.toISOString().slice(0, 10);
+      }
+      const s = String(val).trim();
+      // Check DD/MM/YYYY
+      const dmy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      if (dmy) {
+        const dd = dmy[1].padStart(2, '0');
+        const mm = dmy[2].padStart(2, '0');
+        const yyyy = dmy[3];
+        return `${yyyy}-${mm}-${dd}`;
+      }
+      const dt = new Date(s);
+      if (!isNaN(dt)) return dt.toISOString().slice(0, 10);
+      return s;
+    }
+
+    function findSheet(wb, keyword) {
+      const exact = wb.SheetNames.find(n => normKey(n) === normKey(keyword));
+      if (exact) return wb.Sheets[exact];
+      const partial = wb.SheetNames.find(n => normKey(n).includes(normKey(keyword)));
+      return partial ? wb.Sheets[partial] : null;
+    }
+
     function parseWorkbook(wb, sourceLabel) {
       try {
-        const sStore = wb.Sheets['Dim_Store'];
-        const sProd = wb.Sheets['Dim_Product'];
-        const sInv = wb.Sheets['Fact_Inventory'];
-        const sSales = wb.Sheets['Fact_Sales'];
+        const sStore = findSheet(wb, 'Dim_Store') || findSheet(wb, 'Store');
+        const sProd = findSheet(wb, 'Dim_Product') || findSheet(wb, 'Product');
+        const sInv = findSheet(wb, 'Fact_Inventory') || findSheet(wb, 'Inventory');
+        const sSales = findSheet(wb, 'Fact_Sales') || findSheet(wb, 'Sales');
 
         if (!sStore || !sProd || !sInv || !sSales) {
           alert('File Excel cần có đủ 4 sheet: Dim_Store, Dim_Product, Fact_Inventory, Fact_Sales!');
           return;
         }
 
-        const jsonStore = XLSX.utils.sheet_to_json(sStore);
-        const jsonProd = XLSX.utils.sheet_to_json(sProd);
-        const jsonInv = XLSX.utils.sheet_to_json(sInv);
-        const jsonSales = XLSX.utils.sheet_to_json(sSales, { raw: false });
+        const jsonStore = sheetToSmartObjects(sStore, true);
+        const jsonProd = sheetToSmartObjects(sProd, true);
+        const jsonInv = sheetToSmartObjects(sInv, true);
+        const jsonSales = sheetToSmartObjects(sSales, true);
+
+        const parsedStores = jsonStore.map(r => {
+          const rawType = String(pickField(r, ['phanloaich', 'phanloai', 'loai']) || '').trim();
+          const isSale = normKey(rawType).includes('cochaysale') || (normKey(rawType).includes('co') && !normKey(rawType).includes('khong'));
+          return {
+            id: cleanNum(pickField(r, ['macuahang', 'mach', 'storeid'])),
+            name: String(pickField(r, ['tencuahang', 'tench', 'storename']) || '').trim(),
+            kv: String(pickField(r, ['khuvuc', 'kv']) || '').trim(),
+            asm: String(pickField(r, ['asmquanlykhuvuc', 'asm']) || '').trim(),
+            prov: String(pickField(r, ['tinhthanh', 'tinh']) || '').trim(),
+            cht: String(pickField(r, ['cuahangtruong', 'cht']) || '').trim(),
+            mail: String(pickField(r, ['mailcuahangtruong', 'mail', 'email']) || '').trim(),
+            type: isSale ? 'Có Chạy Sale' : 'Không Chạy Sale'
+          };
+        }).filter(s => s.id > 0);
+
+        const parsedProducts = jsonProd.map(r => {
+          let d = cleanNum(pickField(r, ['tylegiam', 'mucgiam', 'discount']));
+          if (d > 0 && d <= 1) d = Math.round(d * 100);
+          else d = Math.round(d);
+          return {
+            sku: String(pickField(r, ['masanpham', 'masp', 'mahang', 'sku']) || '').trim().toUpperCase(),
+            prog: String(pickField(r, ['tenchuongtrinh', 'chuongtrinh']) || '').trim(),
+            brand: String(pickField(r, ['nhanhang', 'brand']) || '').trim(),
+            line: String(pickField(r, ['donghang', 'line']) || '').trim(),
+            disc: d
+          };
+        }).filter(p => p.sku !== '');
+
+        // Auto-register any missing products or stores found in Fact_Inventory / Fact_Sales so data NEVER drops to 0
+        const storeIdSet = new Set(parsedStores.map(s => s.id));
+        const prodSkuSet = new Set(parsedProducts.map(p => p.sku));
+
+        const parsedInv = [];
+        jsonInv.forEach(r => {
+          const sku = String(pickField(r, ['masanpham', 'masp', 'mahang', 'sku']) || '').trim().toUpperCase();
+          const storeId = cleanNum(pickField(r, ['macuahang', 'mach', 'storeid']));
+          const qty = cleanNum(pickField(r, ['soluongtonkho', 'soluongton', 'slton', 'tonkho', 'qty']));
+          const cost = cleanNum(pickField(r, ['vontonkho', 'vonton', 'giatriton', 'von', 'cost']));
+          if (!sku || !storeId) return;
+          if (!prodSkuSet.has(sku)) {
+            prodSkuSet.add(sku);
+            parsedProducts.push({ sku, prog: 'DM SALE', brand: 'Khác', line: 'Khác', disc: 0 });
+          }
+          if (!storeIdSet.has(storeId)) {
+            storeIdSet.add(storeId);
+            parsedStores.push({ id: storeId, name: 'CH ' + storeId, kv: 'Khác', asm: 'Khác', prov: 'Khác', cht: '', mail: '', type: 'Không Chạy Sale' });
+          }
+          parsedInv.push([sku, storeId, qty, cost]);
+        });
+
+        const parsedSales = [];
+        jsonSales.forEach(r => {
+          const dStr = parseExcelDate(pickField(r, ['dateban', 'ngayban', 'date', 'ngay']));
+          const sku = String(pickField(r, ['masanpham', 'masp', 'mahang', 'sku']) || '').trim().toUpperCase();
+          const storeId = cleanNum(pickField(r, ['macuahang', 'mach', 'storeid']));
+          const qty = cleanNum(pickField(r, ['soluongban', 'slban', 'soluong']));
+          const rev = cleanNum(pickField(r, ['doanhthuban', 'doanhthu', 'thanhtien', 'revenue']));
+          if (!sku || !storeId) return;
+          if (!prodSkuSet.has(sku)) {
+            prodSkuSet.add(sku);
+            parsedProducts.push({ sku, prog: 'DM SALE', brand: 'Khác', line: 'Khác', disc: 0 });
+          }
+          if (!storeIdSet.has(storeId)) {
+            storeIdSet.add(storeId);
+            parsedStores.push({ id: storeId, name: 'CH ' + storeId, kv: 'Khác', asm: 'Khác', prov: 'Khác', cht: '', mail: '', type: 'Không Chạy Sale' });
+          }
+          parsedSales.push([dStr, sku, storeId, qty, rev]);
+        });
 
         rawData = {
           updatedAt: new Date().toLocaleDateString('vi-VN'),
-          stores: jsonStore.map(r => ({
-            id: Number(r['Mã Cửa Hàng']),
-            name: String(r['Tên Cửa Hàng'] || '').trim(),
-            kv: String(r['Khu Vực'] || '').trim(),
-            asm: String(r['ASM Quản Lý Khu Vực'] || '').trim(),
-            prov: String(r['Tỉnh Thành'] || '').trim(),
-            cht: String(r['Cửa Hàng Trưởng'] || '').trim(),
-            mail: String(r['Mail Cửa Hàng Trưởng'] || '').trim(),
-            type: String(r['PHÂN LOẠI CH'] || '').trim()
-          })),
-          products: jsonProd.map(r => {
-            let d = parseFloat(r['TỶ LỆ GIẢM'] || 0);
-            if (d <= 1) d = Math.round(d * 100);
-            return {
-              sku: String(r['Mã Sản Phẩm'] || '').trim(),
-              prog: String(r['TÊN CHƯƠNG TRÌNH'] || '').trim(),
-              brand: String(r['NHÃN HÀNG'] || '').trim(),
-              line: String(r['DÒNG HÀNG'] || '').trim(),
-              disc: d
-            };
-          }),
-          inventory: jsonInv.map(r => [
-            String(r['Mã Sản Phẩm'] || '').trim(),
-            Number(r['Mã Cửa Hàng']),
-            Number(r['Số Lượng Tồn Kho'] || 0),
-            Number(r['Vốn Tồn Kho'] || 0)
-          ]),
-          sales: jsonSales.map(r => {
-            let dStr = String(r['Date Bán'] || '').trim();
-            const dt = new Date(dStr);
-            if (!isNaN(dt)) dStr = dt.toISOString().slice(0, 10);
-            return [
-              dStr,
-              String(r['Mã Sản Phẩm'] || '').trim(),
-              Number(r['Mã Cửa Hàng']),
-              Number(r['Số Lượng Bán'] || 0),
-              Number(r['Doanh Thu Bán'] || 0)
-            ];
-          })
+          stores: parsedStores,
+          products: parsedProducts,
+          inventory: parsedInv,
+          sales: parsedSales
         };
 
-        document.getElementById('dataSourceLabel').textContent = sourceLabel;
+        document.getElementById('dataSourceLabel').textContent = `${sourceLabel} (${parsedInv.length.toLocaleString('vi-VN')} dòng tồn, ${parsedSales.length.toLocaleString('vi-VN')} dòng bán)`;
         if (rawData.products.length > 0 && rawData.products[0].prog) {
           document.getElementById('badgeProgram').textContent = rawData.products[0].prog;
         }
